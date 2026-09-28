@@ -14,7 +14,8 @@
   Open it on its own to TEST the camera on a device: it shows the number it read.
   Address options:  ?ref=NH-CPHW-0001 (order it's for)  &title=Nordic%20Health
 -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.8/html5-qrcode.min.js"></script>
+<!-- Barcode reader: ZXing-C++ compiled to WebAssembly. Much better at ordinary line barcodes on phones. -->
+<script src="https://cdn.jsdelivr.net/npm/zxing-wasm@2.2.0/dist/iife/reader/index.js"></script>
 <style>
   :root{--navy:#1E3A5F;--ink:#22405F;--muted:#5B6F86;--red:#E0482B;--band:#ECEEF2;--bg:#F4F5F8;--ok:#1F7A55}
   *{box-sizing:border-box}
@@ -26,7 +27,9 @@
   .for b{color:var(--navy)}
   .hint{margin:0;color:var(--muted);font-size:17px}
   #reader{width:100%;min-height:240px;background:#0d1b2a;border-radius:12px;overflow:hidden;position:relative}
-  #reader video{border-radius:12px}
+  #reader video{display:block;width:100%;height:auto;border-radius:12px}
+  #reader .frame{position:absolute;left:5%;right:5%;top:25%;bottom:25%;border:3px solid rgba(255,255,255,.9);border-radius:10px;box-shadow:0 0 0 999px rgba(13,27,42,.35);pointer-events:none}
+  #reader .frame::after{content:"";position:absolute;left:4%;right:4%;top:50%;height:2px;background:var(--red);box-shadow:0 0 8px var(--red)}
   #reader .idle{position:absolute;inset:0;display:grid;place-items:center;color:#cfd8e3;font-size:16px;text-align:center;padding:20px}
   .result{background:#E3F3EC;border-radius:12px;padding:14px 16px;text-align:center}
   .result small{display:block;color:var(--ok);font-weight:700;letter-spacing:.04em;text-transform:uppercase;font-size:13px}
@@ -41,8 +44,13 @@
   details{border-top:1px solid var(--band);padding-top:10px}
   summary{cursor:pointer;color:var(--navy);font-weight:600}
   input[type=text]{width:100%;font:inherit;font-size:22px;letter-spacing:.05em;padding:12px;border:2px solid #C9D3DE;border-radius:10px;margin:10px 0;color:var(--ink)}
-  .file{display:block;text-align:center;color:var(--navy);text-decoration:underline;cursor:pointer;font-size:16px}
-  .file input{display:none}
+  .photo{display:flex;align-items:center;justify-content:center;gap:10px;min-height:60px;border-radius:999px;background:var(--red);color:#fff;font-weight:700;font-size:19px;cursor:pointer;text-align:center;padding:12px 20px}
+  .photo svg{width:26px;height:26px;flex:none}
+  .photo input{display:none}
+  .photo.pulse{animation:pulse 1.2s ease-in-out 3}
+  @keyframes pulse{50%{transform:scale(1.04);box-shadow:0 0 0 8px rgba(224,72,43,.18)}}
+  .tip{background:#FFF4D6;color:#8A4B00;border-radius:10px;padding:10px 14px;font-size:16px}
+  .or{text-align:center;color:var(--muted);font-size:14px;margin:-4px 0}
   .hidden{display:none!important}
   :focus-visible{outline:3px solid var(--red);outline-offset:3px}
 </style>
@@ -67,7 +75,11 @@
     <button class="btn primary" type="button" id="send" disabled>Use this barcode</button>
   </div>
 
-  <label class="file">Camera not working? Take a photo of the barcode instead
+  <div class="tip hidden" id="tip">Not reading it? Tap <b>Take a photo</b> below: your phone's own camera focuses better. Fill the photo with the barcode.</div>
+  <p class="or">or</p>
+  <label class="photo" id="photoBtn">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8a2 2 0 0 1 2-2h2l2-2h6l2 2h2a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><circle cx="12" cy="13" r="4"/></svg>
+    Take a photo of the barcode
     <input type="file" id="photo" accept="image/*" capture="environment"></label>
 
   <details id="typeBox">
@@ -84,46 +96,80 @@ const REF = (params.get("ref") || "").replace(/[^A-Za-z0-9-]/g, "").slice(0, 40)
 $("#brand").textContent = (params.get("title") || "").slice(0, 60);
 if (REF){ $("#ref").textContent = REF; $("#for").classList.remove("hidden"); }
 
-let scanner = null, running = false, found = "";
+let stream = null, running = false, found = "", tipTimer = null, busy = false, loopTimer = null;
 function show(el, text){ el.textContent = text; el.classList.toggle("hidden", !text); }
 
-const FORMATS = window.Html5QrcodeSupportedFormats ? [
-  "CODE_128","CODE_39","CODE_93","EAN_13","EAN_8","UPC_A","UPC_E","ITF","CODABAR","QR_CODE","DATA_MATRIX"
-].map(f => Html5QrcodeSupportedFormats[f]).filter(v => v !== undefined) : [];
+const OPTS = { tryHarder: true, tryRotate: true, tryDownscale: true, maxNumberOfSymbols: 1,
+  formats: ["Code128","Code39","Code93","EAN-13","EAN-8","UPC-A","UPC-E","ITF","Codabar","QRCode","DataMatrix"] };
+const Z = window.ZXingWASM;
+if (Z && Z.prepareZXingModule) { try { Z.prepareZXingModule({ fireImmediately: true }); } catch (e) {} }   // start loading the reader now
 
 function explain(e){
   const n = (e && (e.name || e)) + "";
-  if (/NotAllowed|Permission/i.test(n)) return "The camera is blocked. Tap the “aA” or padlock icon next to the web address, allow the Camera, then tap “Start camera”.";
-  if (/NotFound|DevicesNotFound/i.test(n)) return "No camera was found on this device. Take a photo of the barcode or type the number below.";
-  if (/NotReadable|TrackStart/i.test(n)) return "The camera is being used by another app. Close it and tap “Start camera”.";
-  if (/secure|https/i.test(n)) return "The camera only works on a secure (https) page.";
-  return "The camera couldn't start. Take a photo of the barcode or type the number below.";
+  if (/NotAllowed|Permission|Security/i.test(n)) return "The camera is blocked. Tap the “aA” or padlock icon next to the web address, allow the Camera, then tap “Start camera”. Or use “Take a photo” below.";
+  if (/NotFound|DevicesNotFound|Overconstrained/i.test(n)) return "No camera was found on this device. Take a photo of the barcode or type the number below.";
+  if (/NotReadable|TrackStart|Abort/i.test(n)) return "The camera is being used by another app. Close it and tap “Start camera”.";
+  if (!window.isSecureContext) return "The camera only works on a secure (https) page.";
+  return "The camera couldn't start. Use “Take a photo” below, or type the number.";
 }
 
 async function start(){
   show($("#err"), ""); show($("#ok"), "");
-  if (!window.Html5Qrcode){ show($("#err"), "The barcode reader couldn't load. Check the internet connection, or type the number below."); $("#typeBox").open = true; return; }
+  if (!Z){ show($("#err"), "The barcode reader couldn't load. Check the internet connection, or type the number below."); $("#typeBox").open = true; return; }
   found = ""; $("#result").classList.add("hidden"); $("#send").disabled = true;
   if (running) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){ show($("#err"), explain({})); return; }
   try {
-    scanner = scanner || new Html5Qrcode("reader", { formatsToSupport: FORMATS, verbose: false,
-                                                     experimentalFeatures: { useBarCodeDetectorIfSupported: true } });
-    $("#idle") && $("#idle").remove();
-    await scanner.start({ facingMode: "environment" },
-      { fps: 12, qrbox: (w, h) => ({ width: Math.floor(w * 0.85), height: Math.floor(Math.min(h, w) * 0.45) }) },
-      text => onFound(text), () => {});
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: false,
+        video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } } });
+    } catch (first) {
+      if (/NotAllowed|Permission|Security/i.test(first && first.name)) throw first;
+      stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });   // simplest request as a fallback
+    }
+    const track = stream.getVideoTracks()[0];
+    try { await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] }); } catch (e) { /* not every phone allows it */ }
+    $("#reader").innerHTML = '<video playsinline muted autoplay></video><div class="frame"></div>';
+    const v = $("#reader video"); v.srcObject = stream; await v.play();
     running = true; $("#again").textContent = "Scanning…"; $("#again").disabled = true;
+    clearTimeout(tipTimer);
+    tipTimer = setTimeout(() => { if (running && !found){ $("#tip").classList.remove("hidden"); $("#photoBtn").classList.add("pulse"); } }, 8000);
+    loop();
   } catch (e) {
-    running = false; $("#again").textContent = "Start camera"; $("#again").disabled = false;
+    await stop(); $("#again").textContent = "Start camera"; $("#again").disabled = false;
     show($("#err"), explain(e));
   }
 }
-async function stop(){ if (scanner && running){ try { await scanner.stop(); } catch (e) {} } running = false; }
+// About 5 times a second: take the middle band of the camera picture and look for a barcode in it.
+const grab = document.createElement("canvas");
+async function loop(){
+  if (!running) return;
+  const v = $("#reader video");
+  if (v && v.videoWidth && !busy){
+    busy = true;
+    try {
+      const vw = v.videoWidth, vh = v.videoHeight;
+      const sw = Math.round(vw * 0.9), sh = Math.round(vh * 0.6), sx = Math.round((vw - sw) / 2), sy = Math.round((vh - sh) / 2);
+      const k = Math.min(1, 1280 / sw);
+      grab.width = Math.round(sw * k); grab.height = Math.round(sh * k);
+      const g = grab.getContext("2d", { willReadFrequently: true });
+      g.drawImage(v, sx, sy, sw, sh, 0, 0, grab.width, grab.height);
+      const r = await Z.readBarcodes(g.getImageData(0, 0, grab.width, grab.height), OPTS);
+      if (r.length && r[0].text) { busy = false; onFound(r[0].text); return; }
+    } catch (e) { /* try the next frame */ }
+    busy = false;
+  }
+  loopTimer = setTimeout(loop, 200);
+}
+async function stop(){
+  running = false; clearTimeout(loopTimer);
+  if (stream){ stream.getTracks().forEach(t => t.stop()); stream = null; }
+}
 
 async function onFound(text){
   text = String(text || "").trim();
   if (!text || text === found) return;
-  found = text;
+  found = text; clearTimeout(tipTimer); $("#tip").classList.add("hidden");
   await stop();
   if (navigator.vibrate) navigator.vibrate(120);
   $("#code").textContent = text; $("#result").classList.remove("hidden");
@@ -137,12 +183,35 @@ $("#sendTyped").addEventListener("click", () => send($("#typed").value));
 $("#typed").addEventListener("keydown", e => { if (e.key === "Enter") send($("#typed").value); });
 $("#photo").addEventListener("change", async e => {
   const f = e.target.files && e.target.files[0]; if (!f) return;
-  show($("#err"), "");
-  try { await stop(); const s = scanner || new Html5Qrcode("reader", { formatsToSupport: FORMATS, verbose: false }); scanner = s;
-        const text = await s.scanFile(f, false); onFound(text); }
-  catch (err) { show($("#err"), "No barcode found in that photo. Try again closer, with the whole barcode in the picture and in good light."); }
+  show($("#err"), ""); show($("#ok"), "Reading the photo…");
+  try {
+    await stop();
+    const text = await readPhoto(f);
+    show($("#ok"), ""); onFound(text);
+  } catch (err) {
+    show($("#ok"), "");
+    show($("#err"), Z ? "No barcode found in that photo. Take it again closer, straight on, with the whole barcode in the picture and no glare."
+                      : "The barcode reader couldn't load. Check the internet connection, or type the number below.");
+  }
   e.target.value = "";
 });
+// The whole photo first; if nothing is found, zoom into the middle (60%, then 35%) and try again.
+async function readPhoto(file){
+  if (!Z) throw new Error("reader not loaded");
+  let r = await Z.readBarcodes(file, OPTS);
+  if (r.length && r[0].text) return r[0].text;
+  const img = await new Promise((res, rej) => { const u = URL.createObjectURL(file), i = new Image();
+    i.onload = () => { URL.revokeObjectURL(u); res(i); }; i.onerror = rej; i.src = u; });
+  const W = img.naturalWidth, H = img.naturalHeight;
+  for (const crop of [0.6, 0.35]){
+    const sw = Math.round(W * crop), sh = Math.round(H * crop), c = document.createElement("canvas");
+    c.width = sw; c.height = sh; const g = c.getContext("2d");
+    g.drawImage(img, (W - sw) / 2, (H - sh) / 2, sw, sh, 0, 0, sw, sh);
+    r = await Z.readBarcodes(g.getImageData(0, 0, sw, sh), OPTS);
+    if (r.length && r[0].text) return r[0].text;
+  }
+  throw new Error("not found");
+}
 
 function send(text){
   text = String(text || "").trim().slice(0, 64);
@@ -157,6 +226,7 @@ function send(text){
     show($("#ok"), "✓ The camera works. It read: " + text + ". Open this from the order page to link barcodes to orders.");
   }
 }
+window.addEventListener("pagehide", stop);
 
 start();   // most phones allow the camera straight away; if not, the "Start camera" button does it
 </script>
